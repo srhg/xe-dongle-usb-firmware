@@ -36,6 +36,12 @@
 
 #include "main.h"
 
+
+#define BOOTLOADER_START_ADDRESS (0x1800)
+#define SRXE_MAGIC (0x73727865)
+
+uint32_t BootKey ATTR_NO_INIT;
+
 /** Circular buffer to hold data from the host before it is sent to the device via the serial port. */
 static RingBuffer_t USBtoUSART_Buffer;
 
@@ -81,14 +87,24 @@ USB_ClassInfo_CDC_Device_t VirtualSerial_CDC_Interface =
 enum {
 	DEVICE_MODE_CDC = 0,
 	DEVICE_MODE_AVRISP,
+	DEVICE_MODE_BOOTLOADER,
 };
 
-unsigned char DeviceMode __attribute__ ((section (".noinit")));
+unsigned char DeviceMode ATTR_NO_INIT;
 
 enum {
-	CDC_REQ_EC_ReadMagic = 0,
-	CDC_REQ_EC_SetDeviceMode,
+	CONTROL_REQ_GETMAGIC = 0,
+	CONTROL_REQ_DEVICEMODE,
 };
+
+ATTR_INIT_SECTION(3)
+void Bootloader_Jump_Check(void)
+{
+	if ((MCUSR & (1 << WDRF)) && (BootKey == SRXE_MAGIC)) {
+		BootKey = 0;
+		((void (*)(void))BOOTLOADER_START_ADDRESS)();
+	}
+}
 
 /** Main program entry point. This routine contains the overall program flow, including initial
  *  setup of all components and the main program loop.
@@ -142,23 +158,6 @@ void SetupHardware(void)
 	USB_Init();
 }
 
-/** Event handler for the library USB Configuration Changed event. */
-void EVENT_USB_Device_ConfigurationChanged(void)
-{
-	if (DeviceMode == DEVICE_MODE_AVRISP) {
-		/* Setup AVRISP Data OUT endpoint */
-		Endpoint_ConfigureEndpoint(AVRISP_DATA_OUT_EPADDR, EP_TYPE_BULK, AVRISP_DATA_EPSIZE, 1);
-
-		/* Setup AVRISP Data IN endpoint if it is using a physically different endpoint */
-		if ((AVRISP_DATA_IN_EPADDR & ENDPOINT_EPNUM_MASK) != (AVRISP_DATA_OUT_EPADDR & ENDPOINT_EPNUM_MASK)) {
-			Endpoint_ConfigureEndpoint(AVRISP_DATA_IN_EPADDR, EP_TYPE_BULK, AVRISP_DATA_EPSIZE, 1);
-		}
-		return;
-	}
-
-	CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface);
-}
-
 void CDC_Task(void)
 {
 	/* Only try to read in bytes from the CDC interface if the transmit buffer is not full */
@@ -205,63 +204,95 @@ void CDC_Task(void)
 	}
 }
 
+/** Processes incoming V2 Protocol commands from the host, returning a response when required. */
+void AVRISP_Task(void)
+{
+	/* Device must be connected and configured for the task to run */
+	if (USB_DeviceState != DEVICE_STATE_Configured) {
+	    return;
+	}
+
+	V2Params_UpdateParamValues();
+
+	Endpoint_SelectEndpoint(AVRISP_DATA_OUT_EPADDR);
+
+	/* Check to see if a V2 Protocol command has been received */
+	if (Endpoint_IsOUTReceived())
+	{
+		/* Pass off processing of the V2 Protocol command to the V2 Protocol handler */
+		V2Protocol_ProcessCommand();
+	}
+}
+
+/** Event handler for the library USB Configuration Changed event. */
+void EVENT_USB_Device_ConfigurationChanged(void)
+{
+	if (DeviceMode == DEVICE_MODE_AVRISP) {
+		/* Setup AVRISP Data OUT endpoint */
+		Endpoint_ConfigureEndpoint(AVRISP_DATA_OUT_EPADDR, EP_TYPE_BULK, AVRISP_DATA_EPSIZE, 1);
+
+		/* Setup AVRISP Data IN endpoint if it is using a physically different endpoint */
+		if ((AVRISP_DATA_IN_EPADDR & ENDPOINT_EPNUM_MASK) != (AVRISP_DATA_OUT_EPADDR & ENDPOINT_EPNUM_MASK)) {
+			Endpoint_ConfigureEndpoint(AVRISP_DATA_IN_EPADDR, EP_TYPE_BULK, AVRISP_DATA_EPSIZE, 1);
+		}
+		return;
+	}
+
+	CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface);
+}
+
 /** Event handler for the library USB Control Request reception event. */
 void EVENT_USB_Device_ControlRequest(void)
 {
-	static unsigned char cmd = 0xFF;
-
 	if (DeviceMode != DEVICE_MODE_AVRISP) {
 		CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
 	}
 
-	if (!(Endpoint_IsSETUPReceived()) || USB_ControlRequest.wIndex != 0) {
-		return;
-	}
-
-	switch (USB_ControlRequest.bRequest)
-	{
-		case CDC_REQ_SendEncapsulatedCommand:
-			if (USB_ControlRequest.bmRequestType == (REQDIR_HOSTTODEVICE | REQTYPE_CLASS | REQREC_INTERFACE)) {
-				unsigned char arg1;
-
+	if ((USB_ControlRequest.bmRequestType & CONTROL_REQTYPE_TYPE) == REQTYPE_VENDOR) {
+		if ((USB_ControlRequest.bmRequestType & CONTROL_REQTYPE_DIRECTION) == REQDIR_DEVICETOHOST) {
+			switch (USB_ControlRequest.bRequest) {
+			case CONTROL_REQ_GETMAGIC:
 				Endpoint_ClearSETUP();
 
-				while (!(Endpoint_IsOUTReceived())) {
-					if (USB_DeviceState == DEVICE_STATE_Unattached) {
-						return;
-					}
-				}
+				while (!(Endpoint_IsINReady()));
+			
+				Endpoint_Write_32_BE(SRXE_MAGIC);
 
-				cmd = Endpoint_Read_8();
-				if (cmd == CDC_REQ_EC_SetDeviceMode) {
-					arg1 = Endpoint_Read_8();
-				}
+				Endpoint_ClearIN();
+				Endpoint_ClearStatusStage();
+				break;
+			
+			case CONTROL_REQ_DEVICEMODE:
+				Endpoint_ClearSETUP();
+				while(!(Endpoint_IsINReady()));
+
+				Endpoint_Write_8(DeviceMode);
+
+				Endpoint_ClearIN();
+				Endpoint_ClearStatusStage();
+				break;
+			}
+		} else {
+			switch (USB_ControlRequest.bRequest) {
+			case CONTROL_REQ_DEVICEMODE:
+				Endpoint_ClearSETUP();
 
 				Endpoint_ClearOUT();
 				Endpoint_ClearStatusStage();
 
-				if (cmd == CDC_REQ_EC_SetDeviceMode && arg1 != DeviceMode) {
-					DeviceMode = arg1;
-					wdt_enable(WDTO_15MS);
-					while (true);
-				}
-			}
-			break;
+				USB_USBTask();
 
-		case CDC_REQ_GetEncapsulatedResponse:
-			if (USB_ControlRequest.bmRequestType == (REQDIR_DEVICETOHOST | REQTYPE_CLASS | REQREC_INTERFACE)) {
-				Endpoint_ClearSETUP();
-
-				while (!(Endpoint_IsINReady()));
-				
-				if (CDC_REQ_EC_ReadMagic) {
-					Endpoint_Write_32_LE(0x73787265);
+				DeviceMode = USB_ControlRequest.wValue;
+				if (DeviceMode != DEVICE_MODE_AVRISP && DeviceMode != DEVICE_MODE_BOOTLOADER) {
+					DeviceMode = DEVICE_MODE_CDC;
 				}
 
-				Endpoint_ClearIN();
-				Endpoint_ClearStatusStage();
+				BootKey = (DeviceMode == DEVICE_MODE_BOOTLOADER) ? SRXE_MAGIC : 0;
+				wdt_enable(WDTO_15MS);
+				while (true);
+				break;
 			}
-			break;
+		}
 	}
 }
 
@@ -273,7 +304,7 @@ ISR(USART1_RX_vect, ISR_BLOCK)
 	uint8_t ReceivedByte = UDR1;
 
 	if ((USB_DeviceState == DEVICE_STATE_Configured) && !(RingBuffer_IsFull(&USARTtoUSB_Buffer)))
-	  RingBuffer_Insert(&USARTtoUSB_Buffer, ReceivedByte);
+		RingBuffer_Insert(&USARTtoUSB_Buffer, ReceivedByte);
 }
 
 /** Event handler for the CDC Class driver Line Encoding Changed event.
@@ -328,26 +359,6 @@ void EVENT_CDC_Device_LineEncodingChanged(USB_ClassInfo_CDC_Device_t* const CDCI
 
 	/* Release the TX line after the USART has been reconfigured */
 	PORTD &= ~(1 << 3);
-}
-
-/** Processes incoming V2 Protocol commands from the host, returning a response when required. */
-void AVRISP_Task(void)
-{
-	/* Device must be connected and configured for the task to run */
-	if (USB_DeviceState != DEVICE_STATE_Configured) {
-	    return;
-	}
-
-	V2Params_UpdateParamValues();
-
-	Endpoint_SelectEndpoint(AVRISP_DATA_OUT_EPADDR);
-
-	/* Check to see if a V2 Protocol command has been received */
-	if (Endpoint_IsOUTReceived())
-	{
-		/* Pass off processing of the V2 Protocol command to the V2 Protocol handler */
-		V2Protocol_ProcessCommand();
-	}
 }
 
 /** This function is called by the library when in device mode, and must be overridden (see library "USB Descriptors"

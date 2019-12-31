@@ -4,5 +4,6 @@ obj/
 *.elf
 *.hex
 *.lss
+*.map
 *.msp
 *.sym

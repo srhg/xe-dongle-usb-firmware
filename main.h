@@ -57,6 +57,9 @@
 	/* Function Prototypes: */
 		void SetupHardware(void);
 
+		void CDC_Task(void);
+		void AVRISP_Task(void);
+
 		void EVENT_USB_Device_ConfigurationChanged(void);
 		void EVENT_USB_Device_ControlRequest(void);
 
