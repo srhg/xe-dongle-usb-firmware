@@ -46,7 +46,7 @@
 	#define AUX_LINE_PORT              PORTB
 	#define AUX_LINE_PIN               PINB
 	#define AUX_LINE_DDR               DDRB
-	#define AUX_LINE_MASK          (1 << 2)
+	#define AUX_LINE_MASK          (1 << 7)
 
 	#define ENABLE_ISP_PROTOCOL
 	#define ENABLE_XPROG_PROTOCOL
